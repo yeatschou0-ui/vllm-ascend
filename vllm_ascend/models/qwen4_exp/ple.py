@@ -18,25 +18,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import wraps
-from typing import Any, Literal
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.logger import logger
-from vllm.models.qwen4_exp.common.ops.ple import ple_conv as upstream_ple_conv
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from vllm_ascend.attention.utils import wait_for_kv_layer_from_connector
-from vllm_ascend.ops.triton_ple import ple_conv_prefill
-
-
-def _ple_conv_ascend(*args: Any, mode: Literal["decode", "spec", "prefill"], **kwargs: Any) -> None:
-    if mode == "prefill":
-        ple_conv_prefill(*args, **kwargs)
-    else:
-        upstream_ple_conv(*args, mode=mode, **kwargs)
-
+from vllm_ascend.ops.torch_ple import ple_conv_torch
 
 def _get_allow_internal_format() -> bool:
     raw_value = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")
@@ -222,8 +213,6 @@ def _wrap_ple_short_conv(original: Callable[..., Any]) -> Callable[..., Any]:
 
     @wraps(original)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
-        # PLE runs before attention in the same decoder layer.
-        wait_for_kv_layer_from_connector(self.prefix)
         previous = _get_allow_internal_format()
         _set_allow_internal_format(False)
         try:
@@ -266,7 +255,11 @@ def patch_upstream_ple_short_conv() -> None:
 
     # The AMD PLE class binds this function at module import time.  Replace
     # only that model-local binding; other platforms keep the upstream kernel.
-    upstream_ple_layer.ple_conv = _ple_conv_ascend
+    upstream_ple_layer.ple_conv = ple_conv_torch
+
+    from .ple_embedding import AscendPLEHostEmbedding
+
+    upstream_ple_layer.Qwen4ExpPLEPinnedHostEmbedding = AscendPLEHostEmbedding
 
     original_attr = "_ascend_original_short_conv"
     if not hasattr(Qwen4ExpPLELayer, original_attr):
